@@ -630,6 +630,66 @@ class SubGrid(Grid):
         """
         return not all(is_integer(f) for f in self._factors)
 
+    @cached_property
+    def ioffsets(self):
+        """
+        Symbols for the global index of this rank's first point, one pair per
+        space Dimension: `(parent_offset, subgrid_offset)`.
+
+        The interpolation base index `(x*q)//p` is *non-linear*, so it has to
+        be evaluated on the global index and then brought back into local
+        terms:
+
+            base_local = ((x_local + parent_offset)*q)//p - subgrid_offset
+
+        Evaluating it on the local index instead is correct only on the rank
+        whose offsets are both zero -- which, without domain decomposition, is
+        every rank. So in the serial case these are literal zeroes, keeping the
+        inner loop free of the extra arithmetic.
+        """
+        if not self.distributor.is_parallel:
+            zero = sympy.S.Zero
+            return DimensionTuple(
+                *[(zero, zero) for _ in self._parent.dimensions],
+                getters=self._parent.dimensions
+            )
+
+        return DimensionTuple(
+            *[(Scalar(name=f'oi_{d.name}', dtype=np.int32, is_const=True),
+               Scalar(name=f'oi_{ds.name}', dtype=np.int32, is_const=True))
+              for d, ds in zip(self._parent.dimensions, self.dimensions,
+                               strict=True)],
+            getters=self._parent.dimensions
+        )
+
+    @property
+    def ioffset_map(self):
+        """
+        Map from the `ioffsets` symbols to their per-rank values. Empty without
+        domain decomposition, where the offsets are literal zeroes.
+        """
+        if not self.distributor.is_parallel:
+            return {}
+
+        mapper = {}
+        for (po, so), pv, sv in zip(self.ioffsets,
+                                    self._parent.origin_ioffset,
+                                    self.origin_ioffset, strict=True):
+            mapper[po] = int(pv)
+            mapper[so] = int(sv)
+
+        return mapper
+
+    @property
+    def _arg_names(self):
+        return super()._arg_names + tuple(i.name for i in self.ioffset_map)
+
+    def _arg_defaults(self):
+        args = super()._arg_defaults()
+        args.update({k.name: v for k, v in self.ioffset_map.items()})
+
+        return args
+
     def __repr__(self):
         return f"SubGrid[shape={self.shape}, factor={tuple(self._factors)}]"
 

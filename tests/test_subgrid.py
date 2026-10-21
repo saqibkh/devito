@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 
 from devito import Eq, Function, Grid, Operator, SubGrid, switchconfig
-from devito.ir.iet import Expression, FindNodes, Iteration
+from devito.ir.iet import Expression, FindNodes, HaloSpot, Iteration
 from devito.symbolics import retrieve_indexed
 
 COEFFS = (3., 2., 0.5)
@@ -455,3 +455,135 @@ class TestIntegerFactor:
         Operator(Eq(g, g.subs(xs, xs - 1) + f)).apply()
 
         assert np.allclose(np.asarray(g.data)[:, 0], [0., 1., 2., 3.])
+
+
+class TestMPI:
+
+    """
+    Interpolated reads under domain decomposition.
+
+    The parent Grid and the SubGrid are decomposed independently, so a rank's
+    parent points generally need SubGrid points its neighbour owns. Two things
+    have to be right for this to work: the halo exchange must happen at all,
+    and the base index must be computed on the *global* index.
+    """
+
+    @pytest.mark.parallel(mode=[2, 4])
+    @pytest.mark.parametrize('factor', [1.5, 2.5, 0.75])
+    def test_read_matches_serial(self, mode, factor):
+        """
+        Linear interpolation is exact on a linear field, on every rank. Getting
+        the index space wrong leaves rank 0 correct and the others wrong, so
+        this must assert on all of them.
+        """
+        n = 25
+        grid = Grid(shape=(n, n), extent=(float(n - 1),)*2)
+        sub = SubGrid(grid, factor=factor)
+
+        u = Function(name='u', grid=grid, space_order=2)
+        vp = Function(name='vp', grid=sub, space_order=2)
+        vp.data[:] = linear(sub.shape).astype(vp.dtype)
+        u.data[:] = 0.
+
+        Operator(Eq(u, vp)).apply()
+
+        mask, idx = interior(sub, n, 2)
+        expected = expected_at_parent(sub, idx)
+
+        # Compare on this rank's share of the global domain
+        loc = u.local_indices
+        assert np.allclose(np.asarray(u.data)[mask[loc]],
+                           expected[loc][mask[loc]], atol=2e-4)
+
+    @pytest.mark.parallel(mode=[2, 4])
+    def test_base_index_is_global(self, mode):
+        """
+        `IntDiv`/`Mod` are non-linear, so they must be evaluated on the global
+        index. Computing them on the local one is correct only on the rank
+        whose offsets are zero, which is why `test_read_matches_serial` has to
+        check every rank.
+        """
+        grid = Grid(shape=(25, 25), extent=(24., 24.))
+        sub = SubGrid(grid, factor=1.5)
+
+        u = Function(name='u', grid=grid, space_order=2)
+        vp = Function(name='vp', grid=sub, space_order=2)
+
+        op = Operator(Eq(u, vp))
+
+        e, = [i.expr for i in FindNodes(Expression).visit(op) if i.write is u]
+        syms = {s.name for s in e.free_symbols}
+        for d, ds in zip(grid.dimensions, sub.dimensions, strict=True):
+            assert f'oi_{d.name}' in syms
+            assert f'oi_{ds.name}' in syms
+
+    @pytest.mark.parallel(mode=[2, 4])
+    def test_read_matches_serial_3d(self, mode):
+        """
+        3D is where blocking has already run when the subgrid pass sees the
+        Cluster, so it exercises the block-promotion and the global index
+        together.
+        """
+        n = 17
+        grid = Grid(shape=(n,)*3, extent=(float(n - 1),)*3)
+        sub = SubGrid(grid, factor=1.5)
+
+        u = Function(name='u', grid=grid, space_order=2)
+        vp = Function(name='vp', grid=sub, space_order=2)
+        vp.data[:] = linear(sub.shape).astype(vp.dtype)
+        u.data[:] = 0.
+
+        Operator(Eq(u, vp)).apply()
+
+        mask, idx = interior(sub, n, 3)
+        expected = expected_at_parent(sub, idx)
+        loc = u.local_indices
+
+        assert np.allclose(np.asarray(u.data)[mask[loc]],
+                           expected[loc][mask[loc]], atol=2e-4)
+
+    @pytest.mark.parallel(mode=2)
+    def test_needs_a_halo_to_interpolate(self, mode):
+        """
+        The second tap reads `base + 1`, which on a decomposed SubGrid falls in
+        the halo. With `space_order=0` there is none, so the read would run out
+        of bounds -- silently, and only on the ranks that aren't first.
+        """
+        grid = Grid(shape=(25, 25), extent=(24., 24.))
+        sub = SubGrid(grid, factor=1.5)
+
+        u = Function(name='u', grid=grid, space_order=2)
+        vp = Function(name='vp', grid=sub, space_order=0)
+
+        with pytest.raises(ValueError, match='out of bounds'):
+            Operator(Eq(u, vp))
+
+        # One layer is enough
+        vp1 = Function(name='vp1', grid=sub, space_order=1)
+        vp1.data[:] = linear(sub.shape).astype(vp1.dtype)
+        u.data[:] = 0.
+
+        Operator(Eq(u, vp1)).apply()
+
+        mask, idx = interior(sub, 25, 2)
+        expected = expected_at_parent(sub, idx)
+        loc = u.local_indices
+        assert np.allclose(np.asarray(u.data)[mask[loc]],
+                           expected[loc][mask[loc]], atol=2e-4)
+
+    @pytest.mark.parallel(mode=2)
+    def test_halo_exchange_is_emitted(self, mode):
+        """
+        `vp` is never written, but its halo is stale on entry -- `.data` only
+        fills the local domain -- so the exchange must not be dropped.
+        """
+        grid = Grid(shape=(25, 25), extent=(24., 24.))
+        sub = SubGrid(grid, factor=1.5)
+
+        u = Function(name='u', grid=grid, space_order=2)
+        vp = Function(name='vp', grid=sub, space_order=2)
+
+        op = Operator(Eq(u, vp))
+
+        assert len(FindNodes(HaloSpot).visit(op)) == 0      # already lowered
+        assert 'haloupdate' in str(op)

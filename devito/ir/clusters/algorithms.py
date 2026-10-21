@@ -50,6 +50,12 @@ def clusterize(exprs, **kwargs):
     # Input normalization
     clusters = normalize(clusters, **kwargs)
 
+    # Lower SubGrid reads into plain stencils. This must happen before
+    # `communications`, which can only derive a halo exchange from accesses it
+    # can see -- a `SubGridInterp` marker hides them
+    from devito.passes.clusters.subgrid import subgrid_interp
+    clusters = subgrid_interp(clusters, **kwargs)
+
     # Derive the necessary communications for distributed-memory parallelism
     clusters = communications(clusters)
 

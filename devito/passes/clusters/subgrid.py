@@ -88,10 +88,29 @@ def _lower(cluster, sregistry):
                 weights[key] = _phase_weights(fac, func.dtype, name)
             w, ntaps, nphases = weights[key]
 
+            # The second tap reads `base + 1`, which on a decomposed SubGrid
+            # falls in the halo. Without one the read runs out of bounds --
+            # silently, and only on the ranks that aren't first along `d`
+            if nphases > 1 and grid.distributor.is_parallel \
+               and func._size_halo[ds].right < 1:
+                raise ValueError(
+                    f"`{func.name}` is defined on the interpolated SubGrid "
+                    f"`{grid}` with no halo along `{ds}`, so interpolating it "
+                    "onto its parent Grid under MPI would read out of bounds. "
+                    f"Give `{func.name}` a `space_order` of at least 1"
+                )
+
+            # `IntDiv` and `Mod` are non-linear, so they must be evaluated
+            # on the *global* index; under MPI the local one differs by this
+            # rank's offset. `oglb` is the global parent index, `soff` brings
+            # the resulting SubGrid index back into local terms
+            poff, soff = grid.ioffsets[d]
+            oglb = d + poff
+
             # `nphases == 1` means every parent point lands exactly on a
             # SubGrid point: a single tap of unit weight, no interpolation
-            ph = sympy.Mod(d, nphases) if nphases > 1 else None
-            terms.append((ds, d, ph, w, ntaps, frac))
+            ph = sympy.Mod(oglb, nphases) if nphases > 1 else None
+            terms.append((ds, oglb, soff, ph, w, ntaps, frac))
 
         if not terms:
             continue
@@ -133,15 +152,15 @@ def _stencil(func, terms):
     from itertools import product
 
     retval = []
-    ranges = [range(t[4]) if t[2] is not None else range(1) for t in terms]
+    ranges = [range(t[5]) if t[3] is not None else range(1) for t in terms]
     for offsets in product(*ranges):
         weight = sympy.S.One
         indices = {}
-        for (ds, d, ph, w, ntaps, frac), o in zip(terms, offsets,
-                                                  strict=True):
+        for (ds, oglb, soff, ph, w, ntaps, frac), o in zip(terms, offsets,
+                                                           strict=True):
             if ph is not None:
                 weight = weight*w[ntaps*ph + o]
-            indices[ds] = _base(d, frac) + o
+            indices[ds] = _base(oglb, frac) - soff + o
 
         # `func` is indexed directly here, which bypasses the halo shift that
         # index lowering applies to ordinary reads -- so add it explicitly
