@@ -440,10 +440,14 @@ class SubGrid(Grid):
     parent's, and the origin is shared.
 
     An **integer** factor puts SubGrid points exactly on parent points, so the
-    SubGrid is a subsample of the parent and the compiler reaches it by
-    striding. A **non-integer** factor puts them in between, so reading such a
-    Function on the parent grid interpolates; `is_interpolated` distinguishes
-    the two. A factor below 1 refines rather than coarsens.
+    SubGrid is a subsample of the parent and *writing* it is a strided copy.
+    A **non-integer** factor puts them in between, so even a strided write is
+    impossible; `is_interpolated` distinguishes the two. A factor below 1
+    refines rather than coarsens.
+
+    *Reading* a SubGrid Function on the parent grid interpolates either way,
+    since the equation is evaluated at every parent point and only every
+    `factor`-th of them coincides with a SubGrid point.
 
     Parameters
     ----------
@@ -489,14 +493,23 @@ class SubGrid(Grid):
 
     Notes
     -----
-    With an integer factor the points coincide with parent points, so no
-    interpolation is involved: an `Eq` writing a SubGrid Function from a parent
-    Function is a strided copy, and the compiler emits a strided loop for it.
+    A SubGrid Function appearing in an equation is read at the *left-hand
+    side's* location, the same convention a staggered Function follows. It
+    lowers to a plain stencil whose weights come from a compile-time table
+    indexed by the phase, so the loops stay unit-stride and branch-free.
 
-    With a non-integer factor, a SubGrid Function appearing in an equation is
-    read at the *left-hand side's* location, the same convention a staggered
-    Function follows. It lowers to a plain stencil whose weights come from a
-    compile-time table indexed by the phase, so the loops stay unit-stride.
+    The direction matters. `Eq(g, u)` *writes* the SubGrid, so only its own
+    points are visited: with an integer factor that is a strided copy with no
+    interpolation at all. `Eq(u, g)` *reads* it onto the parent grid, so every
+    parent point is computed and the ones falling between two SubGrid points
+    are interpolated -- including when the factor is an integer.
+
+    To write the parent's SubGrid-aligned points alone, leaving the others
+    untouched, make the SubGrid the equation's iteration domain:
+
+        Eq(u, g, subdomain=sub)      # scatter, no interpolation
+
+    which needs the points to coincide, so it requires an integer factor.
     """
 
     is_SubGrid = True

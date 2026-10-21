@@ -247,7 +247,15 @@ class TestExactness:
 
 class TestIntegerFactor:
 
-    """An integer factor needs no interpolation and keeps Part 1's lowering."""
+    """
+    An integer factor needs no interpolation when *writing* the SubGrid -- its
+    points coincide with the parent's, so `Eq(g, u)` is a strided copy and
+    keeps Part 1's lowering.
+
+    *Reading* one on the parent grid is a different matter: `Eq(u, g)` is
+    evaluated at every parent point, and the points in between two SubGrid
+    points do need interpolating.
+    """
 
     def test_not_interpolated(self):
         grid = Grid(shape=(12, 12))
@@ -268,6 +276,116 @@ class TestIntegerFactor:
         Operator(Eq(g, u)).apply()
 
         assert np.array_equal(np.asarray(g.data), data[::3, ::3])
+
+    def test_read_writes_every_parent_point(self):
+        """
+        `Eq(u, vp*u)` writes `u`, so every parent point must be computed. The
+        Cluster still carries the SubGrid's GuardFactors at this stage; leaving
+        them behind lets `subsampling` strengthen them into strided iteration
+        and only every `factor`-th point of `u` gets written -- silently wrong
+        results, not a crash.
+        """
+        n = 9
+        grid = Grid(shape=(n, n), extent=(float(n - 1),)*2)
+        sub = SubGrid(grid, factor=2)
+
+        u = Function(name='u', grid=grid, space_order=2)
+        vp = Function(name='vp', grid=sub, space_order=2)
+        u.data[:] = 1.
+        vp.data[:] = 3.
+
+        op = Operator(Eq(u, vp*u))
+
+        # The loop nest is the parent's, not the SubGrid's
+        dims = [i.dim.name for i in FindNodes(Iteration).visit(op)]
+        assert dims == [d.name for d in grid.dimensions]
+
+        op.apply()
+
+        assert not np.any(np.asarray(u.data) == 1.)
+        assert np.allclose(np.asarray(u.data), 3., atol=1e-5)
+
+    def test_read_is_exact_on_a_linear_field(self):
+        """
+        Reading an integer-factor SubGrid at *every* parent point interpolates
+        at the points falling between two SubGrid points, and linear
+        interpolation is exact there.
+        """
+        n = 17
+        grid = Grid(shape=(n,), extent=(float(n - 1),))
+        sub = SubGrid(grid, factor=2)
+
+        u = Function(name='u', grid=grid, space_order=2)
+        vp = Function(name='vp', grid=sub, space_order=2)
+        vp.data[:] = (3.*np.arange(sub.shape[0])).astype(vp.dtype)
+        u.data[:] = 0.
+
+        Operator(Eq(u, vp)).apply()
+
+        idx = np.arange(n)
+        inside = idx <= (sub.shape[0] - 1)*2 - 1
+        expected = 3.*(idx/2.)
+
+        assert np.allclose(np.asarray(u.data)[inside], expected[inside],
+                           atol=1e-5)
+
+    def test_write_stays_a_strided_copy(self):
+        """Writing the SubGrid must not acquire interpolation weights."""
+        grid = Grid(shape=(13, 13), extent=(12., 12.))
+        sub = SubGrid(grid, factor=2)
+
+        u = Function(name='u', grid=grid, space_order=2)
+        vp = Function(name='vp', grid=sub, space_order=2)
+
+        op = Operator(Eq(vp, u))
+
+        dims = [i.dim.name for i in FindNodes(Iteration).visit(op)]
+        assert dims == [d.name for d in sub.dimensions]
+        assert 'float w' not in str(op)
+
+    def test_explicit_scatter(self):
+        """
+        `subdomain=sub` iterates the SubGrid's points alone, so writing the
+        parent from it scatters: every `factor`-th point is written and the
+        rest keep their previous values.
+        """
+        n = 9
+        grid = Grid(shape=(n, n), extent=(float(n - 1),)*2)
+        sub = SubGrid(grid, factor=2)
+
+        u = Function(name='u', grid=grid, space_order=2)
+        vp = Function(name='vp', grid=sub, space_order=2)
+        u.data[:] = -1.
+        vp.data[:] = 7.
+
+        op = Operator(Eq(u, vp, subdomain=sub))
+
+        # The strided loop over the SubGrid, not the parent's
+        dims = [i.dim.name for i in FindNodes(Iteration).visit(op)]
+        assert dims == [d.name for d in sub.dimensions]
+        assert 'float w' not in str(op)
+
+        op.apply()
+
+        a = np.asarray(u.data)
+        assert np.all(a[::2, ::2] == 7.)
+        assert np.all(a[1::2, :] == -1.)
+        assert np.all(a[:, 1::2] == -1.)
+
+    def test_scatter_rejected_when_interpolated(self):
+        """
+        An interpolated SubGrid has no points on the parent grid, so there is
+        nothing to scatter onto -- it must raise, not silently gather.
+        """
+        grid = Grid(shape=(9, 9), extent=(8., 8.))
+        sub = SubGrid(grid, factor=1.5)
+
+        u = Function(name='u', grid=grid, space_order=2)
+        vp = Function(name='vp', grid=sub, space_order=2)
+
+        # Rejected where the mistake is made, at Eq construction
+        with pytest.raises(ValueError, match='fall \\*between\\*'):
+            Eq(u, vp, subdomain=sub)
 
     def test_self_reference(self):
         """

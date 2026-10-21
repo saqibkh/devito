@@ -80,7 +80,7 @@ class SubGridInterp(sympy.Expr, Evaluable):
         return self
 
 
-def is_subgrid_read(func, target):
+def is_subgrid_read(func, target, domain=None):
     """
     Whether reading `func` at `target`'s location is a SubGrid relocation.
 
@@ -90,12 +90,19 @@ def is_subgrid_read(func, target):
 
     Only the Dimensions `target` actually iterates can be relocated, so a
     SubGrid sharing none of them is not a relocation either.
+
+    `domain` is the Eq's iteration domain, if given. Iterating the SubGrid
+    itself means only its own points are visited, so there is nothing to
+    relocate and the read is a plain scatter -- see `SubGrid`.
     """
     grid = getattr(func, 'grid', None)
     if grid is None or not getattr(grid, 'is_SubGrid', False):
         return False
 
     if getattr(target, 'grid', None) is grid:
+        return False
+
+    if domain is grid:
         return False
 
     return any(d in target.dimensions for d in grid.parent.dimensions)

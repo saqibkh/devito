@@ -4,6 +4,7 @@ import sympy
 
 from devito.finite_differences.interpolation import SubGridInterp
 from devito.ir.clusters import Queue
+from devito.ir.support.guards import GuardFactor
 from devito.symbolics import search, uxreplace
 from devito.tools import timed_pass
 from devito.types import Array, CustomDimension
@@ -111,7 +112,17 @@ def _lower(cluster, sregistry):
             if ds is not d}
     ispace = ispace.project(lambda d: d not in gone)
 
-    return cluster.rebuild(exprs=exprs, ispace=ispace)
+    # An integer-factor SubGrid has ConditionalDimensions, so the Cluster also
+    # carries their GuardFactors -- keyed on the *parent* Dimension. Those
+    # guards described the dropped Dimensions, and leaving them behind would
+    # let `subsampling` strengthen them into strided iteration, writing only
+    # every `factor`-th point of the parent-grid LHS
+    guards = cluster.guards
+    for d, v in cluster.guards.items():
+        if any(g.d in gone for g in v.find(GuardFactor)):
+            guards = guards.popany(d)
+
+    return cluster.rebuild(exprs=exprs, ispace=ispace, guards=guards)
 
 
 def _stencil(func, terms):

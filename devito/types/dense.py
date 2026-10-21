@@ -1136,7 +1136,7 @@ class Function(DiscreteFunction):
         # relocating it onto `func` means re-expressing its indices in the
         # parent's terms. Same convention as staggering: the RHS is evaluated
         # at the LHS's location
-        if is_subgrid_read(self, func):
+        if is_subgrid_read(self, func, kwargs.get('subdomain')):
             # The relocation depends on the iteration index, so it cannot be
             # turned into a stencil here; defer it to the Cluster pass
             return SubGridInterp(self, func)
