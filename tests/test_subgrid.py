@@ -457,6 +457,134 @@ class TestIntegerFactor:
         assert np.allclose(np.asarray(g.data)[:, 0], [0., 1., 2., 3.])
 
 
+class TestSchemes:
+
+    """
+    `interpolation=` selects the scheme: `linear` (2 taps), `cubic` (4,
+    Catmull-Rom) or `sinc` (8, Kaiser windowed).
+    """
+
+    @pytest.mark.parametrize('scheme,ntaps', [('linear', 2), ('cubic', 4),
+                                              ('sinc', 8)])
+    def test_tap_count(self, scheme, ntaps):
+        grid = Grid(shape=(33,), extent=(32.,))
+        sub = SubGrid(grid, factor=1.5, interpolation=scheme)
+
+        u = Function(name='u', grid=grid, space_order=8)
+        vp = Function(name='vp', grid=sub, space_order=8)
+
+        op = Operator(Eq(u, vp))
+
+        e, = [i.expr for i in FindNodes(Expression).visit(op) if i.write is u]
+        reads = {i for i in retrieve_indexed(e) if i.function is vp}
+
+        assert len(reads) == ntaps
+
+    def test_default_is_linear(self):
+        grid = Grid(shape=(12,))
+
+        assert SubGrid(grid, factor=1.5).interpolation == 'linear'
+
+    def test_unknown_scheme_rejected(self):
+        grid = Grid(shape=(12,))
+
+        with pytest.raises(ValueError, match='Unknown interpolation scheme'):
+            SubGrid(grid, factor=1.5, interpolation='quintic')
+
+    @pytest.mark.parametrize('scheme', ['linear', 'cubic', 'sinc'])
+    def test_weights_sum_to_one(self, scheme):
+        """
+        Partition of unity, at every phase -- otherwise a constant field picks
+        up a bias. The windowed sinc needs explicit normalisation for this.
+        """
+        from devito.passes.clusters.subgrid import _taps
+
+        for frac in np.linspace(0., 0.99, 25):
+            assert np.isclose(_taps(scheme, frac).sum(), 1., atol=1e-12)
+
+    @pytest.mark.parametrize('scheme,atol', [('linear', 2e-4), ('cubic', 2e-4),
+                                             ('sinc', 5e-3)])
+    def test_linear_field(self, scheme, atol):
+        """
+        `linear` and `cubic` reproduce a linear field *exactly* -- their taps
+        match its first moment, `sum(w*pos) == frac`. Windowed `sinc` does not:
+        truncating the window perturbs that moment by ~2e-4, so it is accurate
+        but not exact. That is inherent to the scheme, not a defect.
+        """
+        n = 33
+        grid = Grid(shape=(n,), extent=(float(n - 1),))
+        sub = SubGrid(grid, factor=1.5, interpolation=scheme)
+
+        u = Function(name='u', grid=grid, space_order=8)
+        vp = Function(name='vp', grid=sub, space_order=8)
+        vp.data[:] = linear(sub.shape).astype(vp.dtype)
+        u.data[:] = 0.
+
+        Operator(Eq(u, vp)).apply()
+
+        from devito.passes.clusters.subgrid import SCHEMES
+        pad = int(np.ceil(SCHEMES[scheme]*1.5)) + 1
+        idx = np.arange(n)
+        mask = (idx >= pad) & (idx <= int((sub.shape[0] - 1)*1.5) - pad)
+        expected = 3.*(idx/1.5)
+
+        assert np.allclose(np.asarray(u.data)[mask], expected[mask], atol=atol)
+
+    @pytest.mark.parametrize('scheme', ['linear', 'cubic'])
+    def test_first_moment_is_exact(self, scheme):
+        """
+        `sum(w*pos) == frac` is what makes a scheme exact on linear fields.
+        Excludes `sinc`, which trades this for its spectral accuracy.
+        """
+        from devito.passes.clusters.subgrid import SCHEMES, _taps
+
+        r = SCHEMES[scheme]
+        pos = np.arange(-r + 1, r + 1)
+        for frac in np.linspace(0., 0.99, 25):
+            assert np.isclose((_taps(scheme, frac)*pos).sum(), frac,
+                              atol=1e-12)
+
+    def test_higher_order_is_more_accurate(self):
+        """
+        On a field the SubGrid only marginally resolves, the wider stencils win
+        -- which is the whole point of offering them. `sinc` is the best here;
+        on a very smooth field `cubic` edges it, so this uses a short
+        wavelength where the ordering is unambiguous.
+        """
+        n = 129
+        fac = 1.5
+        grid = Grid(shape=(n, n), extent=(float(n - 1),)*2)
+        k = 2*np.pi*8/(n - 1)        # ~10 SubGrid points per cycle
+
+        errs = {}
+        for scheme in ('linear', 'cubic', 'sinc'):
+            sub = SubGrid(grid, factor=fac, interpolation=scheme,
+                          name=scheme[0])
+            u = Function(name=f'u{scheme[0]}', grid=grid, space_order=8)
+            vp = Function(name=f'v{scheme[0]}', grid=sub, space_order=8)
+
+            i, j = np.meshgrid(*[np.arange(s) for s in sub.shape],
+                               indexing='ij')
+            vp.data[:] = np.sin(k*i*fac)*np.cos(k*j*fac)
+            u.data[:] = 0.
+
+            Operator(Eq(u, vp)).apply()
+
+            from devito.passes.clusters.subgrid import SCHEMES
+            pad = int(np.ceil(SCHEMES[scheme]*fac)) + 1
+            px, py = np.meshgrid(np.arange(n), np.arange(n), indexing='ij')
+            exact = np.sin(k*px)*np.cos(k*py)
+            mask = np.ones_like(px, dtype=bool)
+            for q, c in enumerate((px, py)):
+                mask &= (c >= pad) & (c <= int((sub.shape[q] - 1)*fac) - pad)
+
+            errs[scheme] = np.abs(np.asarray(u.data)[mask]
+                                  - exact[mask]).max()
+
+        assert errs['cubic'] < errs['linear']/5.
+        assert errs['sinc'] < errs['cubic']/5.
+
+
 class TestMPI:
 
     """
@@ -570,6 +698,50 @@ class TestMPI:
         loc = u.local_indices
         assert np.allclose(np.asarray(u.data)[mask[loc]],
                            expected[loc][mask[loc]], atol=2e-4)
+
+    @pytest.mark.parallel(mode=[2, 4])
+    @pytest.mark.parametrize('scheme', ['linear', 'cubic', 'sinc'])
+    def test_every_scheme_matches_serial(self, mode, scheme):
+        """The wider stencils reach further into the halo, but still agree."""
+        from devito.passes.clusters.subgrid import SCHEMES
+
+        n, fac = 65, 1.5
+        grid = Grid(shape=(n, n), extent=(float(n - 1),)*2)
+        sub = SubGrid(grid, factor=fac, interpolation=scheme)
+
+        u = Function(name='u', grid=grid, space_order=8)
+        vp = Function(name='vp', grid=sub, space_order=8)
+        vp.data[:] = linear(sub.shape).astype(vp.dtype)
+        u.data[:] = 0.
+
+        Operator(Eq(u, vp)).apply()
+
+        pad = int(np.ceil(SCHEMES[scheme]*fac)) + 1
+        px, py = np.meshgrid(np.arange(n), np.arange(n), indexing='ij')
+        expected = 3.*(px/fac) + 2.*(py/fac)
+        mask = np.ones_like(px, dtype=bool)
+        for q, c in enumerate((px, py)):
+            mask &= (c >= pad) & (c <= int((sub.shape[q] - 1)*fac) - pad)
+
+        loc = u.local_indices
+        assert np.allclose(np.asarray(u.data)[mask[loc]],
+                           expected[loc][mask[loc]], atol=5e-3)
+
+    @pytest.mark.parallel(mode=2)
+    @pytest.mark.parametrize('scheme,ok_so', [('cubic', 2), ('sinc', 4)])
+    def test_halo_depth_scales_with_the_scheme(self, mode, scheme, ok_so):
+        """A wider stencil needs a deeper halo, and says so."""
+        grid = Grid(shape=(65, 65), extent=(64., 64.))
+        sub = SubGrid(grid, factor=1.5, interpolation=scheme)
+
+        u = Function(name='u', grid=grid, space_order=8)
+
+        too_thin = Function(name='thin', grid=sub, space_order=ok_so - 1)
+        with pytest.raises(ValueError, match='out of bounds'):
+            Operator(Eq(u, too_thin))
+
+        enough = Function(name='thick', grid=sub, space_order=ok_so)
+        Operator(Eq(u, enough))      # must not raise
 
     @pytest.mark.parallel(mode=2)
     def test_halo_exchange_is_emitted(self, mode):

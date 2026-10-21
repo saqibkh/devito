@@ -514,10 +514,19 @@ class SubGrid(Grid):
 
     is_SubGrid = True
 
-    def __init__(self, parent, factor, name='s', **kwargs):
+    def __init__(self, parent, factor, name='s', interpolation='linear',
+                 **kwargs):
         if not parent.is_Grid:
             raise ValueError("`parent` must be a Grid, got "
                              f"`{type(parent).__name__}`")
+
+        from devito.passes.clusters.subgrid import SCHEMES
+        if interpolation not in SCHEMES:
+            raise ValueError(
+                f"Unknown interpolation scheme `{interpolation}`, "
+                f"expected one of {sorted(SCHEMES)}"
+            )
+        self._interpolation = interpolation
 
         factors = self.__factors_setup__(parent, factor)
 
@@ -621,6 +630,15 @@ class SubGrid(Grid):
         # Grid" apart from "several unrelated Grids", and rejects the latter
         # under MPI
         return self._parent.root
+
+    @property
+    def interpolation(self):
+        """
+        The scheme used to read a Function on this SubGrid at its parent's
+        points: `'linear'` (2 taps), `'cubic'` (4, Catmull-Rom) or `'sinc'`
+        (8, Kaiser windowed).
+        """
+        return self._interpolation
 
     @property
     def is_interpolated(self):
