@@ -29,6 +29,17 @@ def restricted(factor, n=25, ndim=2):
     return sub, u, vp
 
 
+def expected_at_parent(sub, idx):
+    """
+    `linear` evaluated at the parent points `idx`, in SubGrid index units.
+
+    A parent point `x` sits at SubGrid coordinate `x/factor`, so this is what
+    an exact read of a `linear`-valued SubGrid Function must produce.
+    """
+    return sum(c*(i/float(f)) for c, i, f in
+               zip(COEFFS[:len(idx)], idx, sub.factor, strict=True))
+
+
 def interior(sub, n, ndim):
     """Mask of parent points whose stencil stays inside the SubGrid."""
     idx = np.meshgrid(*[np.arange(n)]*ndim, indexing='ij')
@@ -187,7 +198,7 @@ class TestExactness:
         sub, u, _ = restricted(factor, n=n, ndim=1)
 
         mask, idx = interior(sub, n, 1)
-        expected = 3.*(idx[0]/float(sub.factor[0]))
+        expected = expected_at_parent(sub, idx)
 
         assert np.allclose(np.asarray(u.data)[mask], expected[mask], atol=2e-4)
 
@@ -197,8 +208,7 @@ class TestExactness:
         sub, u, _ = restricted(factor, n=n, ndim=2)
 
         mask, idx = interior(sub, n, 2)
-        f0, f1 = [float(v) for v in sub.factor]
-        expected = 3.*(idx[0]/f0) + 2.*(idx[1]/f1)
+        expected = expected_at_parent(sub, idx)
 
         assert np.allclose(np.asarray(u.data)[mask], expected[mask], atol=2e-4)
 
@@ -213,8 +223,7 @@ class TestExactness:
         sub, u, _ = restricted(factor, n=n, ndim=3)
 
         mask, idx = interior(sub, n, 3)
-        expected = sum(c*(i/float(f)) for c, i, f in
-                       zip(COEFFS, idx, sub.factor, strict=True))
+        expected = expected_at_parent(sub, idx)
 
         assert np.allclose(np.asarray(u.data)[mask], expected[mask], atol=2e-4)
 
@@ -342,6 +351,48 @@ class TestIntegerFactor:
         dims = [i.dim.name for i in FindNodes(Iteration).visit(op)]
         assert dims == [d.name for d in sub.dimensions]
         assert 'float w' not in str(op)
+
+    @pytest.mark.parametrize('factor', [3, (3, 1), (2, 3)])
+    def test_scatter_per_axis(self, factor):
+        """Each axis scatters on its own factor, including a factor-1 axis."""
+        n = 13
+        grid = Grid(shape=(n, n), extent=(float(n - 1),)*2)
+        sub = SubGrid(grid, factor=factor)
+
+        u = Function(name='u', grid=grid, space_order=2)
+        vp = Function(name='vp', grid=sub, space_order=2)
+        u.data[:] = -1.
+        vp.data[:] = 7.
+
+        Operator(Eq(u, vp, subdomain=sub)).apply()
+
+        a = np.asarray(u.data)
+        f0, f1 = [int(v) for v in sub.factor]
+        assert np.all(a[::f0, ::f1] == 7.)
+        # Nothing outside the aligned points was touched
+        assert int((a != -1.).sum()) == a[::f0, ::f1].size
+
+    @pytest.mark.parametrize('factor', [3, (3, 1), (2, 3)])
+    def test_gather_per_axis_is_exact(self, factor):
+        """
+        Reading at every parent point is exact on a linear field for per-axis
+        integer factors too, where the aligned and interpolated axes mix.
+        """
+        n = 17
+        grid = Grid(shape=(n, n), extent=(float(n - 1),)*2)
+        sub = SubGrid(grid, factor=factor)
+
+        u = Function(name='u', grid=grid, space_order=2)
+        vp = Function(name='vp', grid=sub, space_order=2)
+        vp.data[:] = linear(sub.shape).astype(vp.dtype)
+        u.data[:] = 0.
+
+        Operator(Eq(u, vp)).apply()
+
+        mask, idx = interior(sub, n, 2)
+        expected = expected_at_parent(sub, idx)
+
+        assert np.allclose(np.asarray(u.data)[mask], expected[mask], atol=2e-4)
 
     def test_explicit_scatter(self):
         """
